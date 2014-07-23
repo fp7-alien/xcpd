@@ -12,11 +12,57 @@
 #include "cportvlan_mapper.h"
 #include <rofl/common/utils/c_logger.h>
 #include <typeinfo>
+#include "control_manager.h"
+
 // #include "morpheus_nested.h"
 const PV_PORT_T PV_PORT_T::ANY = PV_PORT_T::make_ANY();
 const PV_VLANID_T PV_VLANID_T::ANY = PV_VLANID_T::make_ANY();
 const PV_VLANID_T PV_VLANID_T::NONE = PV_VLANID_T::make_NONE();
 #define PROXYOFPVERSION OFP10_VERSION
+
+const int morpheus::PATH_CLOSED= 0;
+const int morpheus::PATH_WAIT= 1;
+const int morpheus::PATH_OPEN= 2;
+
+morpheus::morpheus(const cportvlan_mapper & mapper_, const bool indpt_, const rofl::caddress dptaddr_, const bool inctl_, const rofl::caddress ctladdr_ ): \
+		rofl::crofbase (1 <<  PROXYOFPVERSION),
+		m_slave(0),
+		m_master(0),
+		m_mapper(mapper_),
+		m_supported_features(0),
+		m_supported_actions_mask( (1<<OFP10AT_OUTPUT)|(1<<OFP10AT_SET_DL_SRC)|(1<<OFP10AT_SET_DL_DST)|(1<<OFP10AT_SET_NW_SRC)|(1<<OFP10AT_SET_NW_DST)|(1<<OFP10AT_SET_NW_TOS)|(1<<OFP10AT_SET_TP_SRC)|(1<<OFP10AT_SET_TP_DST) ),
+		m_supported_actions(0),
+		m_dpe_supported_actions(0),
+		m_dpe_supported_actions_valid(false),
+		indpt(indpt_),
+		inctl(inctl_),
+		dptaddr(dptaddr_),
+		ctladdr(ctladdr_),
+		m_crof_timer_opaque_offset(0x10000000),
+		m_crof_timer_opaque_max(0x00000fff),
+		m_last_crof_timer_opaque(m_crof_timer_opaque_offset+1),
+		max_session_lifetime(6),
+		m_session_timers(m_crof_timer_opaque_max+1)
+{
+    fet= new flow_entry_translate(this);
+	pthread_rwlock_init(&m_sessions_lock, 0);
+	pthread_rwlock_init(&m_session_timers_lock, 0);
+	ctlmsgqueue= std::vector <rofl::cofmsg *> ();
+	dptmsgqueue= std::vector <rofl::cofmsg *> ();
+
+    
+    dpt_state= PATH_CLOSED;
+    ctl_state= PATH_CLOSED;
+}
+
+morpheus::~morpheus() {
+	// rpc_close_all();
+    ROFL_DEBUG("%s:  called.\n",__PRETTY_FUNCTION__);
+	pthread_rwlock_destroy(&m_sessions_lock);
+	pthread_rwlock_destroy(&m_session_timers_lock);
+    delete(fet);
+}
+
 
 std::ostream & operator<< (std::ostream & os, const morpheus & morph) {
 	os << "morpheus configuration:\n" << morph.dump_config();
@@ -29,35 +75,39 @@ std::ostream & operator<< (std::ostream & os, const morpheus & morph) {
 // print out a hexdump of bytes
 void dumpBytes (std::ostream & os, uint8_t * bytes, size_t n_bytes) {
 	if (0==n_bytes) return;
-	for(size_t i = 0; i < (n_bytes-1); ++i) printf("%02x ", bytes[i]);
+	for(size_t i = 0; i < (n_bytes-1); ++i) {
+		printf("%02x ", bytes[i]);
+	}
 	printf("%02x", bytes[n_bytes-1]);
 }
 
 std::string morpheus::dump_sessions() const {
 	std::stringstream ss;
-/*	std::cout << __FUNCTION__ << ": waiting for lock." << std::endl;
-	rofl::RwLock lock(&m_sessions_lock, rofl::RwLock::RWLOCK_WRITE);
-	std::cout << __FUNCTION__ << ": got lock." << std::endl; */
-	for(xid_session_map_t::const_iterator it = m_sessions.begin(); it != m_sessions.end(); ++it)
-		ss << "ctl xid " << it->first.first << " dpt xid " << it->first.second << ": " << it->second->asString() << "\n";
-//		ss << ((it->first.first)?"ctl":"dpt") << " xid " << it->first.second << ": " << it->second->asString() << "\n";
+	for(xid_session_map_t::const_iterator it = m_sessions.begin();
+		it != m_sessions.end(); ++it)
+		ss << "ctl xid " << it->first.first << " dpt xid " << 
+			it->first.second << ": " << 
+			it->second->asString() << "\n";
 	return ss.str();
 }
 
 std::string morpheus::dump_config() const {	// TODO
-	return "";
+	return "Morpheus Configuration";
 }
 
 bool morpheus::associate_xid( const uint32_t ctl_xid, const uint32_t dpt_xid, chandlersession_base * p ) {
 	std::pair< uint32_t, uint32_t > e ( ctl_xid, dpt_xid );
 	xid_session_map_t::iterator sit(m_sessions.find( e ));
 	if(sit!=m_sessions.end()) {
-        ROFL_ERR("Attempt was made to associate %d/%d with %s but pair exists\n",
+        ROFL_ERR("%s: Attempt was made to associate %ld/%ld with %s but pair exists\n",
+            __PRETTY_FUNCTION__,
             ctl_xid, dpt_xid, p->asString().c_str());
 		return false;	// new_xid was already in the database
 	}
-    ROFL_DEBUG("Associated %d/%d with %s but pair exists\n",
+    ROFL_DEBUG("%s: Associated %ld/%ld with %s\n",
+			__PRETTY_FUNCTION__,
             ctl_xid, dpt_xid, p->asString().c_str());
+    m_sessions[e]=p;
     return true;
 }
 
@@ -80,9 +130,6 @@ flow_entry_translate *morpheus::get_fet()
 // called to remove all associations to this session_base - returns the number of associations removed - p is not deleted and reamins in the ownership of the caller
 unsigned morpheus::remove_session( chandlersession_base * p ) {
 	unsigned tally = 0;
-/*	std::cout << __FUNCTION__ << ": waiting for lock." << std::endl;
-	rofl::RwLock lock(&m_sessions_lock, rofl::RwLock::RWLOCK_WRITE);
-	std::cout << __FUNCTION__ << ": got lock." << std::endl; */
 	xid_session_map_t::iterator it = m_sessions.begin();
 	xid_session_map_t::iterator old_it;
 	while(it!=m_sessions.end()) {
@@ -99,7 +146,7 @@ unsigned morpheus::remove_session( chandlersession_base * p ) {
 }
 
 void morpheus::set_supported_dpe_features (uint32_t new_capabilities, uint32_t new_actions) {
-	// TODO new_capabilities are ignored, befause, well, we don't support any of them.
+	// TODO new_capabilities are ignored, because we don't support any of them.
 	// m_supported_features = 0;
 	m_dpe_supported_actions = new_actions;
 	m_supported_actions = new_actions & m_supported_actions_mask;
@@ -111,7 +158,7 @@ uint32_t morpheus::get_supported_actions() {
 		// we have no information on supported actions from the DPE, so we're going to have to ask ourselves.
 		std::auto_ptr < morpheus::csh_features_request > s ( new morpheus::csh_features_request ( this ) );
 		{ rofl::RwLock lock(&m_session_timers_lock, rofl::RwLock::RWLOCK_WRITE); register_lifetime_session_timer(s.get(), max_session_lifetime); }
-		std::cout << __FUNCTION__ << ": sent request for features. Waiting..";
+		ROFL_DEBUG("%s: sent request for features. Waiting.\n");
 		unsigned wait_time = 5;
 		while(wait_time && !s->isCompleted()) {
 			sleep(1);	// TODO possible error - is crofbase a single thread, or is every call to a crofbase handler a new thread?
@@ -127,111 +174,188 @@ uint32_t morpheus::get_supported_actions() {
 	return m_supported_actions;
 }
 
-
-morpheus::morpheus(const cportvlan_mapper & mapper_, const bool indpt_, const rofl::caddress dptaddr_, const bool inctl_, const rofl::caddress ctladdr_ ): \
-		rofl::crofbase (1 <<  PROXYOFPVERSION),
-		m_slave(0),
-		m_master(0),
-		m_mapper(mapper_),
-		m_supported_features(0),
-		m_supported_actions_mask( (1<<OFP10AT_OUTPUT)|(1<<OFP10AT_SET_DL_SRC)|(1<<OFP10AT_SET_DL_DST)|(1<<OFP10AT_SET_NW_SRC)|(1<<OFP10AT_SET_NW_DST)|(1<<OFP10AT_SET_NW_TOS)|(1<<OFP10AT_SET_TP_SRC)|(1<<OFP10AT_SET_TP_DST) ),
-		m_supported_actions(0),
-		m_dpe_supported_actions(0),
-		m_dpe_supported_actions_valid(false),
-		indpt(indpt_),
-		inctl(inctl_),
-		dptaddr(dptaddr_),
-		ctladdr(ctladdr_),
-		m_crof_timer_opaque_offset(0x10000000),
-		m_crof_timer_opaque_max(0x00000fff),
-		m_last_crof_timer_opaque(m_crof_timer_opaque_offset+1),
-		max_session_lifetime(6),
-		m_session_timers(m_crof_timer_opaque_max+1)
-		{
-    fet= new flow_entry_translate(this);
-	pthread_rwlock_init(&m_sessions_lock, 0);
-	pthread_rwlock_init(&m_session_timers_lock, 0);
+void morpheus::set_ctl_watcher() {
+    if (ctl_state != PATH_CLOSED) {
+        ROFL_DEBUG("%s: called but ctl not closed\n");
+        return;
+    }
+    ctl_state= PATH_WAIT;
+	if(inctl) {
+		ROFL_DEBUG("Connecting to controller %s xcpd in listening mode\n",
+			ctladdr.c_str());
+		rpc_listen_for_ctls(ctladdr);
+	}
+	else {
+		ROFL_DEBUG("Connecting to controller %s xcpd in active mode\n",
+			ctladdr.c_str());
+		rpc_connect_to_ctl(PROXYOFPVERSION,1,ctladdr);
+	}
+	ROFL_DEBUG ("Waiting for control path\n");
 }
 
-morpheus::~morpheus() {
-	// rpc_close_all();
+void morpheus::set_dpt_watcher() {
+    if (dpt_state != PATH_CLOSED) {
+        ROFL_DEBUG("%s: called but dpt not closed\n",
+			__PRETTY_FUNCTION__);
+        return;
+    }
+    dpt_state= PATH_WAIT;
     ROFL_DEBUG("%s called.\n",__PRETTY_FUNCTION__);
-	pthread_rwlock_destroy(&m_sessions_lock);
-	pthread_rwlock_destroy(&m_session_timers_lock);
-    delete(fet);
+	if (!indpt) {
+		ROFL_DEBUG("Connecting to switch %s switch in active mode\n",
+			dptaddr.c_str());
+		rpc_listen_for_dpts(dptaddr);
+	} else {
+		ROFL_DEBUG("Connecting to switch %s switch in listening mode\n",
+			dptaddr.c_str());
+		rpc_connect_to_dpt(PROXYOFPVERSION,1,dptaddr);
+	}
+	ROFL_DEBUG("%s exiting.\n",__PRETTY_FUNCTION__);
 }
-
 
 void morpheus::initialiseConnections(){
 	// set up connection to controller (active or passive)
-	if(inctl) rpc_listen_for_ctls(ctladdr);
-	else rpc_connect_to_ctl(PROXYOFPVERSION,5,ctladdr);
+	set_ctl_watcher();
 }
 
 rofl::cofdpt * morpheus::get_dpt() const { return m_slave; }
 rofl::cofctl * morpheus::get_ctl() const { return m_master; }
 
 void morpheus::handle_error (rofl::cofdpt *src, rofl::cofmsg_error *msg) {
-	std::cout << std::endl << "handle_error from " << src->c_str() << " : " << msg->c_str() << std::endl;
+	ROFL_DEBUG("handle_error from %s:%s\n ",src->c_str(),
+		msg->c_str());
 	rofl::RwLock lock(&m_sessions_lock, rofl::RwLock::RWLOCK_WRITE);
 	xid_session_map_t::iterator sit;
-	for(sit = m_sessions.begin() ; sit != m_sessions.end(); ++sit) if(sit->first.second==msg->get_xid()) break;
+	// Look for xid
+	for(sit = m_sessions.begin() ; sit != m_sessions.end(); ++sit) {
+		if(sit->first.second==msg->get_xid()) 
+			break;
+	}
 	if(sit!=m_sessions.end()) {
-		sit->second->handle_error( src, msg);
-	} else std::cout << "**** received error message ( " << msg->c_str() << " ) from dpt ( " << std::hex << src << std::dec << " ) for unknown xid ( " << msg->get_xid() << " ). Dropping." << std::endl;
+		sit->second->handle_error(src, msg);
+	} else {
+		ROFL_ERR("Received error message (%s) from dpt (%xd) for unknown xid %d.  Dropping!\n",
+			msg->c_str(), src, msg->get_xid());
+	}
 	delete(msg);
 }
 
-void morpheus::handle_ctrl_open (rofl::cofctl *src) {
-	// should be called automatically after call to rpc_connect_to_dpt in connect_to_slave
-	std::cout << std::endl << "morpheus::handle_ctrl_open called with " << (src?src->c_str():"NULL") << std::endl;
-	if (m_master == src) { std::cout << __FUNCTION__ << ": duplicate ctl received. Ignoring." << std::endl; return; }	// this is a fiddle - ROFL send spurious duplicate handle_ctrl_open sometimes.
-	m_master = src;	// TODO - what to do with previous m_master?
-		try {
-			if(indpt) rpc_listen_for_dpts(dptaddr);
-			else rpc_connect_to_dpt(PROXYOFPVERSION, 5, dptaddr);
-		} catch (rofl::eSocketBindFailed & e) {
-			std::cout << __FUNCTION__ << " << caught and ignored rofl::eSocketBindFailed: " << e << std::endl;
-		} catch (rofl::cerror & e) {
-			std::cout << __FUNCTION__ << " << caught and ignored rofl::cerror: " << e << std::endl;
-		} catch (...) {
-			std::cout << __FUNCTION__ << " << caught something. " << std::endl;
+void morpheus::process_ctlqueue()
+{
+	for(std::vector<rofl::cofmsg *>::iterator it = ctlmsgqueue.begin();
+		it != ctlmsgqueue.end(); ++it) {
+		cofmsg_features_request *fr=  dynamic_cast<cofmsg_features_request *> (*it);
+		if (fr != 0) {
+			handle_features_request(m_master, fr);
+			continue;
 		}
+		ROFL_DEBUG("%s: popping ctl message queue message not handled %s\n", 
+			__PRETTY_FUNCTION__,(*it)->c_str());
+		delete(*it);
+		
+	}
+	ctlmsgqueue= std::vector<rofl::cofmsg *> ();
+}
+
+void morpheus::process_dptqueue()
+{
+	for(std::vector<rofl::cofmsg *>::iterator it = dptmsgqueue.begin();
+		it != dptmsgqueue.end(); ++it) {
+		
+		cofmsg_get_config_reply *cr= dynamic_cast<cofmsg_get_config_reply *> (*it);
+		if (cr != 0) {
+			handle_get_config_reply(m_slave,cr);
+			continue;
+		}
+		cofmsg_features_reply *fr=  dynamic_cast<cofmsg_features_reply *> (*it);
+		if (fr != 0) {
+			handle_features_reply(m_slave, fr);
+			continue;
+		}
+		ROFL_DEBUG("%s: popping dpt message queue -- message not handled %s\n", 
+			__PRETTY_FUNCTION__,(*it)->c_str());
+		delete(*it);
+	}
+	dptmsgqueue= std::vector<rofl::cofmsg *> ();
+}
+
+
+void morpheus::handle_ctrl_open (rofl::cofctl *src) {
+	ROFL_DEBUG("%s called with %s\n",__PRETTY_FUNCTION__,
+		(src?src->c_str():"NULL"));
+    ctl_state= PATH_OPEN;
+	if (m_master == src) { 
+		ROFL_DEBUG("%s : received contact from old controller, keeping it.\n",
+			__PRETTY_FUNCTION__);
+		return;
+	}	
+	else if (m_master != 0) {
+		ROFL_DEBUG("%s : received replacement controller.\n");
+		process_ctlqueue();
+		return;
+	}
+	m_master= src;
+	try {
+		if (m_slave == 0) {
+			set_dpt_watcher();
+		}
+	} catch (rofl::eSocketBindFailed & e) {
+		ROFL_ERR("%s threw rofl::eSocketBind error\n",
+			__PRETTY_FUNCTION__);
+	} catch (rofl::cerror & e) {
+		ROFL_ERR("%s threw rofl::cerror\n",
+			__PRETTY_FUNCTION__);
+	}
+	ROFL_DEBUG("%s finished.\n",__PRETTY_FUNCTION__);
 }
 
 // TODO are all transaction IDs invalidated by a connection reset??
 void morpheus::handle_ctrl_close (rofl::cofctl *src) {
-	std::cout << "morpheus::handle_ctrl_close called with " << (src?src->c_str():"NULL") << std::endl;
+	ROFL_INFO("morpheus::handle_ctrl_close called with %s\n",
+		(src?src->c_str():"NULL"));
+    ctl_state= PATH_CLOSED;
 	// controller disconnected - now disconnect from switch.
 	rpc_disconnect_from_dpt(m_slave);
-	// hopefully dpt will reconnect to us, causing us in turn to reconnect to ctl.
 	
 	// this socket disconnecting could just be a temporary thing - mark it is dead, but expect a possible auto reconnect
-	if(src!=m_master) std::cout << "morpheus::handle_ctrl_close: was expecting " << (m_master?m_master->c_str():"NULL") << " but got " << (src?src->c_str():"NULL") << std::endl;
-	m_master=0;	// TODO - m_naster ownership?
-	// TODO make attempt to re-establish CTL connection?
+	if(src!=m_master) {
+		ROFL_ERR("In %s closing control path does not match that opened %s\n",
+		(m_master?m_master->c_str():"NULL"),
+		(src?src->c_str():"NULL")
+		);
+	}
+	m_master=0;	
 }
 
 void morpheus::handle_dpath_open (rofl::cofdpt *src) {
 	// should be called automatically after call to rpc_connect_to_dpt in connect_to_slave
-	std::cout << std::endl << "morpheus::handle_dpath_open called with " << (src?src->c_str():"NULL") << std::endl;
-	m_slave = src;	// TODO - what to do with previous m_slave?
-	m_slave_dpid=src->get_dpid();	// TODO - check also get_config, get_capabilities etc
-	m_dpid = m_slave_dpid + 1;
-/*	if(!m_master){
-		if(inctl) rpc_listen_for_ctls(ctladdr);
-		else rpc_connect_to_ctl(PROXYOFPVERSION,5,ctladdr);
-	} */
+    dpt_state= PATH_OPEN;
+	ROFL_DEBUG("%s called with %s\n", __PRETTY_FUNCTION__,
+		(src?src->c_str():"NULL"));
+	m_slave = src;
+	m_slave_dpid= xdpd::control_manager::Instance()->get_dpid();
+	m_dpid = m_slave_dpid;
+	process_ctlqueue();
+	process_dptqueue();
 }
 
 // TODO are all transaction IDs invalidated by a connection reset??
 void morpheus::handle_dpath_close (rofl::cofdpt *src) {
-	std::cout << std::endl << "handle_dpath_close called with " << (src?src->c_str():"NULL") << std::endl;
-	if(src!=m_slave) std::cout << "morpheus::handle_dpath_close: Was expecting " << (m_slave?m_slave->c_str():"NULL") << " but got " << (src?src->c_str():"NULL") << std::endl;
-	// this socket disconnecting could just be a temporary thing - mark it is dead, but expect a possible auto reconnect
-	m_slave=0;	// TODO - m_slave ownership?
-
-	rpc_disconnect_from_ctl(m_master);
+    
+	ROFL_DEBUG("%s called with %s\n",__PRETTY_FUNCTION__,
+		(src?src->c_str():"NULL"));
+	if(src!=m_slave) {
+		ROFL_ERR("In %s closing datapath does not match that opened %s\n",
+		(m_slave?m_slave->c_str():"NULL"),
+		(src?src->c_str():"NULL")
+		);
+	}
+	m_slave=0;	
+	// If master is still open try to reconnect
+	if (m_master != 0) {
+		set_dpt_watcher();
+	}
+    dpt_state= PATH_CLOSED;
 }
 
 
@@ -247,7 +371,8 @@ int morpheus::register_session_timer(morpheus::chandlersession_base * s, unsigne
 	for(off = 0; off < m_crof_timer_opaque_max; ++off) {
 		if(!m_session_timers[(opaque+off)%m_crof_timer_opaque_max]) { break; }	// found a null entry - it can be our next opaque
 	}
-	if(off==m_crof_timer_opaque_max) throw std::range_error("Ran out of session timer opaque values.");
+	if(off==m_crof_timer_opaque_max) 
+		throw std::range_error("Ran out of session timer opaque values.");
 	opaque = (opaque+off)%m_crof_timer_opaque_max;
 	if(m_session_timers[opaque]) {
         ROFL_ERR("Timer added to session already present in %s\n",__PRETTY_FUNCTION__);
@@ -255,7 +380,8 @@ int morpheus::register_session_timer(morpheus::chandlersession_base * s, unsigne
 	m_session_timers[opaque] = s;
 	opaque += m_crof_timer_opaque_offset;
 	register_timer(opaque, seconds);
-    ROFL_DEBUG("Registered session %s with opaque %d\n",s, opaque);
+    ROFL_DEBUG("Registered session %s with opaque %d\n",
+		s->asString().c_str(), opaque);
 	m_last_crof_timer_opaque = opaque;
 	return opaque;
 }
@@ -264,13 +390,15 @@ int morpheus::register_session_timer(morpheus::chandlersession_base * s, unsigne
 // this method handles all the timing events - these can be either session lifetime evenets, or some secondary event created by a session.
 // ** THIS METHOD IS THE ONE THAT REMOVES AN EXPIRED SESSION FROM m_session_timers and the sessions database.
 void morpheus::handle_timeout ( int opaque ) {
-	std::cout << "****" << __FUNCTION__ << " called with opaque = " << std::hex << opaque << "/" << (opaque-m_crof_timer_opaque_offset) << std::dec << std::endl;
+	ROFL_DEBUG("%s : called with opaque = %xd / %xd \n",
+		__PRETTY_FUNCTION__, opaque, (opaque-m_crof_timer_opaque_offset));
 	// TODO make sure to remove *all* instances of the pointer to the session from the m_session_timers array (scan for value in array, swap with 0, delete whats pointed to by array
 	// check that this is a session_timer
 	int opaque_off = opaque - m_crof_timer_opaque_offset;
 	rofl::RwLock session_timers_lock(&m_session_timers_lock, rofl::RwLock::RWLOCK_WRITE);
 	if(!m_session_timers[opaque_off]) {
-		std::cout << __FUNCTION__ << " called with unknwon opaque " << std::hex << opaque << std::dec << "." << std::endl;
+		ROFL_ERR("%s : called with  unknown opaque = %xd / %xd \n",
+		__PRETTY_FUNCTION__, opaque, (opaque-m_crof_timer_opaque_offset));
 		assert(false);
     }
 	morpheus::chandlersession_base * s = m_session_timers[opaque_off];
@@ -281,17 +409,25 @@ void morpheus::handle_timeout ( int opaque ) {
 		std::replace(m_session_timers.begin(), m_session_timers.end(), s, (morpheus::chandlersession_base *) 0);
 		// now remove from sessions database and delete
 		if(!s->isCompleted()) {
-			std::cout << "ERROR: timeout occured on session " << std::hex << s << std::dec << " (" << typeid(*s).name() << ") which wasn't completed." << std::endl;
+			ROFL_DEBUG("%s : called on session %xd %s which wasn't completed\n",
+		__PRETTY_FUNCTION__, s,typeid(*s).name());
 			// TODO send error?
 			}
 		rofl::RwLock lock(&m_sessions_lock, rofl::RwLock::RWLOCK_WRITE);
-		std::cout << "About to delete session " << s->asString() << std::endl;
+		ROFL_DEBUG("%s : deleting session %s. \n",
+			__PRETTY_FUNCTION__, s->asString().c_str());
 		delete(s);
 	} else {
 		// this is a timer belonging to some other session function, so tell the session
 //		std::cout << "About to call s->handle_timeout on " << s->asString() << std::endl;
 		s->handle_timeout(opaque);
 	}
+}
+
+void morpheus::check_locks() 
+{
+	rofl::RwLock session_lock(&m_sessions_lock, rofl::RwLock::RWLOCK_WRITE); 
+	rofl::RwLock session_timers_lock(&m_session_timers_lock, rofl::RwLock::RWLOCK_WRITE);
 }
 
 #undef STRINGIFY
@@ -301,46 +437,104 @@ void morpheus::handle_timeout ( int opaque ) {
 
 // this is from a ctl if CTL_DPT is true, false otherwise
 #define HANDLE_REQUEST_WITH_REPLY_TEMPLATE(CTL_DPT, MSG_TYPE, SESSION_TYPE) { \
-	std::cout << std::endl << func << " from " << src->c_str() << " : " << msg->c_str() << std::endl; \
-	if((!m_slave)||(!m_master)) { std::cout << "Dropping message due to lack of CTL/DPT connectivity." << std::endl; delete(msg); return; } \
-	rofl::RwLock session_lock(&m_sessions_lock, rofl::RwLock::RWLOCK_WRITE); \
-	rofl::RwLock session_timers_lock(&m_session_timers_lock, rofl::RwLock::RWLOCK_WRITE); \
+	ROFL_DEBUG("%s from %s : %s\n", func, src->c_str(), msg->c_str()); \
+	if((!m_slave)||(!m_master)) { \
+		ROFL_DEBUG("%s: queueing message due to lack of dpt/ctl\n",func); \
+		if (CTL_DPT) ctlmsgqueue.push_back(msg);   \
+		else dptmsgqueue.push_back(msg);   \
+		return; \
+	} \
+	check_locks(); \
 	try { \
-		SESSION_TYPE * s = new SESSION_TYPE ( this, src, msg ); /* this isn't a leak as the constructor of the session should register the xids and the pointer will stay in the  */ \
-		if(!s) {} \
-	} catch(rofl::cerror &e) { std::cout << "unhandled rofl::cerror: " << e.desc << std::endl; assert(false); } \
-	catch (...) { std::cout << __FUNCTION__ << ": unhandled exception"; assert(false); } \
+		new SESSION_TYPE ( this, src, msg ); /* this isn't a leak as the constructor of the session should register the xids and the pointer will stay in the  */ \
+	} catch(rofl::cerror &e) { \
+		ROFL_ERR("%s: Unhandled cerror %s\n",func, e.desc.c_str()); assert(false); } \
 	delete(msg); \
 }
 
 #define HANDLE_REPLY_AFTER_REQUEST_TEMPLATE(CTL_DPT, MSG_TYPE, SESSION_TYPE, REPLY_FN) { \
-	rofl::RwLock session_lock(&m_sessions_lock, rofl::RwLock::RWLOCK_WRITE); \
-	rofl::RwLock session_timers_lock(&m_session_timers_lock, rofl::RwLock::RWLOCK_WRITE); \
-	if(CTL_DPT) { std::cout << "Unhandled case in " << __FUNCTION__ << std::endl; /* no messages do this */ } else { \
-	xid_session_map_t::iterator it; \
-	for(it = m_sessions.begin() ; it != m_sessions.end(); ++it) if(it->first.second==msg->get_xid()) break; \
-	if(it == m_sessions.end()) { std::cout << func << ": Unexpected " << TOSTRING(MSG_TYPE) << " received with xid " << msg->get_xid() << ". Dropping new message." << std::endl; return; } \
-	if((!m_slave)||(!m_master)) { std::cout << "Dropping message due to lack of CTL/DPT connectivity." << std::endl; delete(msg); return; } \
-	SESSION_TYPE * s = dynamic_cast<SESSION_TYPE *>(it->second); \
-	if(!s) { std::cout << func << ": xid (" << msg->get_xid() << ") maps to existing session of wrong type." << std::endl; } \
+	if(CTL_DPT) { \
+		ROFL_ERR("%s: message unexpectedly marked as control type\n",func); \
+		return; \
+	} \
+	if((!m_slave)||(!m_master)) { \
+		ROFL_DEBUG("%s: No control/datapath queueing message\n",func); \
+		dptmsgqueue.push_back(msg); \
+		return; \
+	} \
+	check_locks(); \
+	chandlersession_base *b= get_chandlersession(msg); \
+	if (b == 0) { \
+		ROFL_ERR("%s: cannot find xid for %s\n",func, msg->c_str()); \
+		delete(msg); \
+		return; \
+	} \
+	SESSION_TYPE * s = dynamic_cast<SESSION_TYPE *>(b); \
+	if(!s) { \
+		ROFL_ERR("%s : Session resolved to wrong type discarded %s\n", \
+			func, b); \
+	} \
 	try { \
 		s->REPLY_FN( src, msg ); \
 		if(s->isCompleted()) { remove_session(s); delete(s); } \
-	} catch(rofl::cerror &e) { std::cout << "unhandled rofl::cerror: " << e.desc << std::endl; assert(false); } \
-	catch (...) { std::cout << __FUNCTION__ << ": unhandled exception"; assert(false); } \
+	} catch(rofl::cerror &e) { \
+		ROFL_ERR("%s: Unhandled error %s\n",func, e.desc.c_str()); assert(false); } \
 	delete(msg); \
-	} \
 }
 
 #define HANDLE_MESSAGE_FORWARD_TEMPLATE(CTL_DPT, SESSION_TYPE) { \
-	std::cout << std::endl << func << " from " << src->c_str() << " : " << msg->c_str() << "." << std::endl; \
-	if((!m_slave)||(!m_master)) { std::cout << "Dropping message due to lack of CTL/DPT connectivity." << std::endl; delete(msg); return; } \
+	ROFL_DEBUG("%s: from %s message %s\n", func, src->c_str(), msg->c_str()); \
+	if((!m_slave)||(!m_master)) { \
+		ROFL_DEBUG("%s: queueing message due to lack of dpt/ctl\n",func); \
+		if (CTL_DPT) ctlmsgqueue.push_back(msg);   \
+		else dptmsgqueue.push_back(msg);   \
+		return; \
+	} \
+	check_locks(); \
 	try { \
-		SESSION_TYPE * s = new SESSION_TYPE ( this, src, msg ); \
-		{ rofl::RwLock session_timers_lock(&m_session_timers_lock, rofl::RwLock::RWLOCK_WRITE); register_lifetime_session_timer(s, max_session_lifetime); } /* timer takes ownership of session */ \
-	} catch(rofl::cerror &e) { std::cout << "unhandled rofl::cerror: " << e.desc << std::endl; assert(false); } \
-	catch (...) { std::cout << __FUNCTION__ << ": unhandled exception"; assert(false); } \
+		new SESSION_TYPE ( this, src, msg ); \
+	} catch(rofl::cerror &e) { \
+		ROFL_ERR("%s: unhandled cerror %s\n",func,e.desc.c_str()); assert(false); \
+	} \
 	delete(msg); \
+}
+
+/**Find which chandler session is in map*/
+morpheus::chandlersession_base * morpheus::get_chandlersession(rofl::cofmsg *msg)
+{
+	xid_session_map_t::iterator it; 
+	for(it = m_sessions.begin() ; 
+		it != m_sessions.end(); ++it) {
+		if(it->first.second == msg->get_xid()) 
+			break;
+	}
+	if(it == m_sessions.end()) { 
+		ROFL_ERR("%s: cannot find session for %s with xid %ld\n",
+			__PRETTY_FUNCTION__,msg->c_str(),msg->get_xid());
+		/*std::cout << func << ": Unexpected " << TOSTRING(MSG_TYPE) << " received with xid " << msg->get_xid() << ". Dropping new message." << std::endl; return; } */
+		return 0;
+	}
+	return it->second;
+}
+
+void morpheus::wait_for_slave()
+{
+	for (unsigned int i= 0; i < 3; i++) {
+		if (!m_slave) {
+			ROFL_DEBUG("%s: No datapath sleep.\n",__PRETTY_FUNCTION__);
+			sleep(3);
+		}
+	}
+}
+
+void morpheus::wait_for_master()
+{
+	for (unsigned int i= 0; i < 3; i++) {
+		if (!m_master) {
+			ROFL_DEBUG("%s: No control path sleep.\n",__PRETTY_FUNCTION__);
+			sleep(3);
+		}
+	}
 }
 
 
@@ -348,10 +542,12 @@ void morpheus::handle_flow_mod(rofl::cofctl * src, rofl::cofmsg_flow_mod *msg) {
 	static const char * func = __FUNCTION__;
 	HANDLE_MESSAGE_FORWARD_TEMPLATE(true, morpheus::csh_flow_mod)
 }
+
 void morpheus::handle_features_request(rofl::cofctl *src, rofl::cofmsg_features_request * msg ) {
 	static const char * func = __FUNCTION__;
 	HANDLE_REQUEST_WITH_REPLY_TEMPLATE( true, cofmsg_features_request, morpheus::csh_features_request )
 }
+
 void morpheus::handle_features_reply(rofl::cofdpt * src, rofl::cofmsg_features_reply * msg ) {
 	static const char * func = __FUNCTION__;
 	HANDLE_REPLY_AFTER_REQUEST_TEMPLATE( false, cofmsg_features_reply, morpheus::csh_features_request, process_features_reply )
@@ -455,13 +651,15 @@ void morpheus::handle_flow_stats_reply(rofl::cofdpt *src, rofl::cofmsg_flow_stat
 }
 
 void morpheus::handle_queue_stats_request(rofl::cofctl *src, rofl::cofmsg_queue_stats_request *msg) {
-	static const char * func = __FUNCTION__;
-	std::cout << std::endl << func << " from " << src->c_str() << " : " << msg->c_str() << std::endl;
+	//static const char * func = __FUNCTION__;
+	ROFL_WARN("%s: not implemented\n",__PRETTY_FUNCTION__);
 	delete(msg);
 }
 void morpheus::handle_experimenter_stats_request(rofl::cofctl *src, rofl::cofmsg_stats_request *msg) {
-	static const char * func = __FUNCTION__;
-	std::cout << std::endl << func << " from " << src->c_str() << " : " << msg->c_str() << std::endl;
+	
+	//static const char * func = __FUNCTION__;
+	
+	ROFL_WARN("%s:  not implemented\n",__PRETTY_FUNCTION__);
 	delete(msg);
 }
 
@@ -470,13 +668,11 @@ void morpheus::handle_port_mod(rofl::cofctl *src, rofl::cofmsg_port_mod *msg) {
 	HANDLE_MESSAGE_FORWARD_TEMPLATE(true, morpheus::csh_port_mod)
 }
 void morpheus::handle_queue_get_config_request(rofl::cofctl *src, rofl::cofmsg_queue_get_config_request *msg) {
-	static const char * func = __FUNCTION__;
-	std::cout << std::endl << func << " from " << src->c_str() << " : " << msg->c_str() << std::endl;
+	ROFL_WARN("%s: not implemented\n",__PRETTY_FUNCTION__);
 	delete(msg);
 }
 void morpheus::handle_experimenter_message(rofl::cofctl *src, rofl::cofmsg_features_request *msg) {
-	static const char * func = __FUNCTION__;
-	std::cout << std::endl << func << " from " << src->c_str() << " : " << msg->c_str() << std::endl;
+	ROFL_WARN("%s:  not implemented\n",__PRETTY_FUNCTION__);
 	delete(msg);
 }
 
@@ -511,6 +707,5 @@ std::string capabilities_to_string(uint32_t capabilities) {
 	for(size_t index=0; capabilities!=0; ++index, capabilities >>= 1) if(capabilities & 0x00000001) out += capabilities_sz[index] + " ";
 	return out;
 }
-
 
 

@@ -47,7 +47,23 @@ int main(int argc, char** argv){
         std::cout << "Translate threw error when it should not\n" << std::endl;
         return 0;
     }
-    
+    for (int i=1; i <= 4; i++) {
+        match.set_in_port(i);
+        rofl::cofmsg_flow_mod fm= rofl::cofmsg_flow_mod(OFP10_VERSION,
+            0,0,0,0,0,0,0,0,0,outlist, match);
+        std::cout << "Translate and add flow entry\n" << std::endl;
+        rofl::cflowentry entry= morph.get_fet()->get_flowentry_from_msg(&fm);
+        rofl::cflowentry trans(OFP10_VERSION);
+        trans= morph.get_fet()->trans_flow_entry(entry);
+        morph.get_fet()->add_flow_entry(entry,trans);
+    }
+    match.set_in_port(1);
+    rofl::cofmsg_flow_mod fm2= rofl::cofmsg_flow_mod(OFP10_VERSION,
+        0,0,0,0,0,0,0,0,0,outlist, match);
+    std::vector <cflowentry> fes= morph.get_fet()-> get_translated_matches_and_delete
+        (match,0,true);
+    std::cout << "Got translated " << fes.size() << "(should be 1)" <<
+        std::endl;
     return 0;
 }
 
@@ -64,6 +80,7 @@ void print_translate_match(rofl::cofmatch &match, morpheus & morph)
     try {
         vid= newmatch.get_vlan_vid();
     } catch (...) {
+		ROFL_ERR("Problem with match in %s\n",__PRETTY_FUNCTION__);
     }
     std::cout << "translated match port:vlan " << newmatch.get_in_port() <<
         ":" << vid << std::endl;

@@ -1,0 +1,72 @@
+#Add the following lines to /etc/network/interfaces
+
+iface C_0 inet manual
+iface C_1 inet manual
+iface LE1_0 inet manual
+iface LE1_1 inet manual
+iface vonuA_0 inet manual
+iface vonuA_1 inet manual
+iface vonuA_1.10 inet manual
+iface vonuB_0 inet manual
+iface vonuB_1 inet manual
+iface vonuB_1.11 inet manual
+iface vonuC_0 inet manual
+iface vonuC_1 inet manual
+iface vonuC_1.12 inet manual
+iface LV1_0 inet manual
+iface LV1_1 inet manual
+iface V1 inet manual
+iface V1a inet manual
+iface V2 inet manual
+iface V2a inet manual
+iface V3 inet manual
+iface V3a inet manual
+iface V4 inet manual
+iface V4a inet manual
+
+#restart network manager
+
+sudo restart network-manager
+
+#Disable ipv6 -- edit /etc/sysctl.conf
+#  Add as last line
+net.ipv6.conf.all.disable_ipv6 = 1
+
+# Restart with
+sudo sysctl -p
+
+#install some prerequisites
+
+sudo apt get install python-scapy bridge-utils vlan
+
+# FIRST TEST software only xdpd
+
+#start links
+sudo ./start_simple_test_links.sh 
+#start xdpd
+sudo xdpd -c xdpd_only_test.cfg 
+
+./oft -H 127.0.0.1 -p 6635 -i 1@V1a -i 2@V2a -i 3@V3a -i 4@V4a basic
+./oft -H 127.0.0.1 -p 6635 -i 1@V1a -i 2@V2a -i 3@V3a -i 4@V4a flow_matches
+./oft -H 127.0.0.1 -p 6635 -i 1@V1a -i 2@V2a -i 3@V3a -i 4@V4a actions
+
+
+
+#Run the network namespace creation script:
+sudo ./create_netns_config.sh
+
+# once you're done with it stop it all with  sudo ./delete_netns_config.sh
+
+#The three interfaces we care about in the default namespace are: C1_0, the control channel, LE1_0, the untagged "upstream" interface, and LV1_0 which is the OLT interface which is then split into interfaces which present untagged VLANs in the SW2 namespace
+
+In one terminal run xdpd (in default namespace):
+sudo xdpd -d all -c soft_xdpd_test.cfg
+
+In a second terminal run xcpd (in default namespace):
+sudo xcpd -c soft_xdpd_test.cfg
+
+// In one xterm (the one where oftest will run), start shell in the SW namespace:
+sudo ip netns exec SW bash
+cd ~/code/oftest
+
+./oft -H 10.100.0.2 -p 6633 -i 1@LE1_1 -i 2@vonuA_1.10 -i 3@vonuB_1.11 -i 4@vonuC_1.12 basic

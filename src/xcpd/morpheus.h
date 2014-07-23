@@ -51,7 +51,16 @@ public:
 	class csh_set_config;
 
 private:
-    flow_entry_translate *fet;
+    flow_entry_translate *fet; // Class used to translate flow entries
+	std::vector <rofl::cofmsg *> ctlmsgqueue; //queue of messages going up to controller
+	std::vector <rofl::cofmsg *> dptmsgqueue; // queue of messages going down to data path
+	
+	void check_locks();
+	void process_ctlqueue();
+	void process_dptqueue();
+    void wait_for_slave();
+    void wait_for_master();
+	chandlersession_base * get_chandlersession(rofl::cofmsg *);
 
 protected:
     
@@ -79,6 +88,13 @@ protected:
     
     bool indpt, inctl;
     rofl::caddress dptaddr, ctladdr;
+    
+    int dpt_state;
+    int ctl_state;
+    
+    static const int PATH_CLOSED;
+    static const int PATH_WAIT;
+    static const int PATH_OPEN;
 
     const int m_crof_timer_opaque_offset;	// the minimum opaque value for the session timeout timers, so supplied to register_timer
     const int m_crof_timer_opaque_max;	// the largest number above offset for the opaque values - this will also be the largest size of m_session_timeout_timers
@@ -127,7 +143,7 @@ protected:
 	virtual void handle_queue_get_config_request(rofl::cofctl *ctl, rofl::cofmsg_queue_get_config_request * msg );
 	virtual void handle_experimenter_message(rofl::cofctl *ctl, rofl::cofmsg_features_request * msg );
 	virtual void handle_flow_mod(rofl::cofctl *ctl, rofl::cofmsg_flow_mod * msg );
-// timeout methods?
+// timeout methods
 	virtual void handle_timeout ( int opaque );
 	virtual void handle_error ( rofl::cofdpt * src, rofl::cofmsg_error * msg );
 
@@ -153,6 +169,8 @@ public:
     int register_session_timer(morpheus::chandlersession_base *, unsigned seconds);
     void register_lifetime_session_timer(morpheus::chandlersession_base * s, unsigned seconds);
     void cancel_session_timer(int opaque);
+    void set_ctl_watcher();
+    void set_dpt_watcher();
     
     uint32_t get_supported_actions();
     uint32_t get_supported_features() { return m_supported_features; }

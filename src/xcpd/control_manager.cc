@@ -4,6 +4,7 @@
 
 #include "control_manager.h"
 #include <iostream>
+#include <iomanip>
 
 using namespace std;
 
@@ -17,10 +18,32 @@ using namespace std;
 using namespace rofl;
 using namespace xdpd;
 
+int virtual_port::port_count= 1;
+
+virtual_port::virtual_port() {
+}
+
 virtual_port::virtual_port(std::string n, int port) {
     name= n;
     real_port= port;
     vlan= NO_VLAN;
+    init_port();
+}
+
+void virtual_port::init_port()
+{
+    std::stringstream stream("00:00:00:00:00:");
+    stream.seekp(0, std::ios::end);
+    stream << std::hex << std::setw(2) << std::setfill('0') 
+		<< port_count << std::dec;
+   
+    mac= rofl::cmacaddr(stream.str().c_str());
+    std::stringstream stream2("");
+    stream2 << "vport_" << port_count;
+    name= stream2.str();
+    port_count++;
+    //cout << "Mac is " << stream.str() << " " << mac << " name is " <<
+	//	stream2.str() << endl;
     //cout << "New Port phys:" << port << " NO VLAN" << endl;
 }
 
@@ -29,6 +52,30 @@ virtual_port::virtual_port(std::string n, int port,int v) {
     real_port= port;
     vlan= v;
     //cout << "New Port phys:" << port << " VLAN " << v << endl;
+    init_port();
+}
+
+rofl::cmacaddr virtual_port::get_mac()
+{
+	return mac;
+}
+
+void virtual_port::set_mac(rofl::cmacaddr m)
+{
+	mac= m;
+	//cout << "MAC is " << mac.c_str() << endl;
+}
+
+std::string virtual_port::get_name()
+{
+	//cout << "PORT NAME " << name << endl;
+	return name;
+}
+
+void virtual_port::set_name(std::string n)
+{
+	name= n;
+	//cout << "PORT NAME " << name << endl;
 }
 
 int virtual_port::get_real_port()
@@ -216,15 +263,18 @@ int control_manager::get_port_no(std::string n)
 
 void control_manager::set_switch_to_xcpd_conn_passive()
 {
+	//cout << "Switch passive" <<endl;
     switch_to_xcpd_conn= PASSIVE_CONNECTION;
 }
 void control_manager::set_switch_to_xcpd_conn_active()
 {
+	//cout << "Switch active" <<endl;
     switch_to_xcpd_conn= ACTIVE_CONNECTION;
 }
      
 bool control_manager::is_switch_to_xcpd_conn_active()
 {
+	//cout << "switch is active "<< (switch_to_xcpd_conn == ACTIVE_CONNECTION) << endl;
     return (switch_to_xcpd_conn == ACTIVE_CONNECTION);
 }
 
